@@ -13,6 +13,8 @@ class DomainError(ValueError):
 
 ELEMENT_KINDS = {"character", "costume", "prop", "injury"}
 RULES = {"stable", "monotonic", "allowed"}
+CAST_ROLES = {"lead", "standin"}
+SHOT_TYPES = {"dialogue", "action"}
 
 
 class ContinuityDB:
@@ -69,6 +71,7 @@ class ContinuityDB:
               shot_code TEXT NOT NULL,
               shoot_order INTEGER NOT NULL CHECK(shoot_order > 0),
               narrative_order INTEGER NOT NULL CHECK(narrative_order > 0),
+              shot_type TEXT NOT NULL DEFAULT 'dialogue' CHECK(shot_type IN ('dialogue','action')),
               description TEXT NOT NULL DEFAULT '',
               status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','locked')),
               version INTEGER NOT NULL DEFAULT 0,
@@ -141,8 +144,50 @@ class ContinuityDB:
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS actors (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              production_id INTEGER NOT NULL REFERENCES productions(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              UNIQUE(production_id,name)
+            );
+            CREATE TABLE IF NOT EXISTS character_cast (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              element_id INTEGER NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+              cast_role TEXT NOT NULL CHECK(cast_role IN ('lead','standin')),
+              updated_by INTEGER NOT NULL REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              UNIQUE(element_id,actor_id)
+            );
+            CREATE TABLE IF NOT EXISTS shot_performances (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              element_id INTEGER NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              updated_by INTEGER NOT NULL REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              UNIQUE(shot_id,element_id)
+            );
+            CREATE TABLE IF NOT EXISTS rotation_filings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              element_id INTEGER NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              note TEXT NOT NULL DEFAULT '',
+              filed_by INTEGER NOT NULL REFERENCES users(id),
+              filed_at TEXT NOT NULL,
+              UNIQUE(element_id,shot_id,actor_id)
+            );
             """
         )
+        shot_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(shots)")}
+        if "shot_type" not in shot_cols:
+            self.conn.execute(
+                "ALTER TABLE shots ADD COLUMN shot_type TEXT NOT NULL DEFAULT 'dialogue' "
+                "CHECK(shot_type IN ('dialogue','action'))"
+            )
         self.conn.commit()
 
     def seed_demo(self) -> None:
@@ -158,6 +203,14 @@ class ContinuityDB:
         injury = self.add_element(production, "主角左臂伤痕", "injury", "monotonic", "伤痕严重程度只能递增")
         self.set_element_state(s01, injury, "重度", 3, "", continuity)
         self.set_element_state(s02, injury, "轻度", 1, "", continuity)
+        lead = self.add_actor(production, "沈亦", "主演", producer)
+        double = self.add_actor(production, "阿杰", "动作替身", producer)
+        hero = self.add_element(production, "林岚（主角）", "character", "stable", "主角，动作戏可用替身")
+        self.set_cast(hero, lead, "lead", producer)
+        self.set_cast(hero, double, "standin", producer)
+        self.set_shot_type(s01, "action", continuity)
+        self.set_performance(s01, hero, double, continuity)
+        self.set_performance(s02, hero, double, continuity)
         self.check_scene(scene)
 
     def add_user(self, name: str, role: str) -> int:
@@ -205,7 +258,7 @@ class ContinuityDB:
         return int(cur.lastrowid)
 
     def add_shot(self, scene_id: int, shot_code: str, shoot_order: int, narrative_order: int,
-                 description: str, user_id: int) -> int:
+                 description: str, user_id: int, shot_type: str = "dialogue") -> int:
         scene = self.conn.execute("SELECT production_id FROM scenes WHERE id=?", (scene_id,)).fetchone()
         if not scene:
             raise DomainError("场次不存在")
@@ -214,12 +267,14 @@ class ContinuityDB:
             raise DomainError("无权创建镜头")
         if not shot_code.strip() or shoot_order <= 0 or narrative_order <= 0:
             raise DomainError("镜头参数无效")
+        if shot_type not in SHOT_TYPES:
+            raise DomainError("镜头类型必须是 dialogue 或 action")
         with self.transaction():
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO shots(scene_id,shot_code,shoot_order,narrative_order,description,updated_by,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (scene_id, shot_code.strip(), shoot_order, narrative_order, description.strip(), user_id, datetime.now().isoformat()),
+                    "INSERT INTO shots(scene_id,shot_code,shoot_order,narrative_order,shot_type,description,updated_by,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (scene_id, shot_code.strip(), shoot_order, narrative_order, shot_type, description.strip(), user_id, datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("场次内镜头编号或叙事顺序重复") from exc
@@ -256,6 +311,68 @@ class ContinuityDB:
                 raise DomainError("该状态转移已存在") from exc
         return int(cur.lastrowid)
 
+    def _character_element(self, element_id: int) -> sqlite3.Row:
+        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
+        if not element or element["kind"] != "character":
+            raise DomainError("只有角色元素可以安排演员")
+        return element
+
+    def _actor_in_production(self, production_id: int, actor_id: int) -> sqlite3.Row:
+        actor = self.conn.execute("SELECT * FROM actors WHERE id=?", (actor_id,)).fetchone()
+        if not actor or actor["production_id"] != production_id:
+            raise DomainError("演员不属于该项目")
+        return actor
+
+    def add_actor(self, production_id: int, name: str, note: str, user_id: int) -> int:
+        if not self.conn.execute("SELECT 1 FROM productions WHERE id=?", (production_id,)).fetchone():
+            raise DomainError("项目不存在")
+        self._production_for_user(production_id, user_id)
+        if not name.strip():
+            raise DomainError("演员姓名不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO actors(production_id,name,note,created_at) VALUES(?,?,?,?)",
+                    (production_id, name.strip(), note.strip(), datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该项目已存在同名演员") from exc
+        return int(cur.lastrowid)
+
+    def set_cast(self, element_id: int, actor_id: int, cast_role: str, user_id: int) -> dict:
+        element = self._character_element(element_id)
+        self._production_for_user(element["production_id"], user_id)
+        self._actor_in_production(element["production_id"], actor_id)
+        if cast_role not in CAST_ROLES:
+            raise DomainError("选角身份必须是 lead 或 standin")
+        with self.transaction():
+            try:
+                self.conn.execute(
+                    "INSERT INTO character_cast(element_id,actor_id,cast_role,updated_by,updated_at) VALUES(?,?,?,?,?)",
+                    (element_id, actor_id, cast_role, user_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError:
+                self.conn.execute(
+                    "UPDATE character_cast SET cast_role=?,updated_by=?,updated_at=? WHERE element_id=? AND actor_id=?",
+                    (cast_role, user_id, datetime.now().isoformat(), element_id, actor_id),
+                )
+            reopened, scenes = self._recheck_cast(element_id, user_id)
+        return {"element_id": element_id, "actor_id": actor_id, "cast_role": cast_role,
+                "reopened_shots": reopened, "scenes": scenes}
+
+    def remove_cast(self, element_id: int, actor_id: int, user_id: int) -> dict:
+        element = self._character_element(element_id)
+        self._production_for_user(element["production_id"], user_id)
+        with self.transaction():
+            cur = self.conn.execute(
+                "DELETE FROM character_cast WHERE element_id=? AND actor_id=?", (element_id, actor_id)
+            )
+            if cur.rowcount == 0:
+                raise DomainError("该演员未登记在此角色下")
+            reopened, scenes = self._recheck_cast(element_id, user_id)
+        return {"element_id": element_id, "actor_id": actor_id,
+                "reopened_shots": reopened, "scenes": scenes}
+
     def set_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
                           note: str, user_id: int) -> dict:
         shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
@@ -286,6 +403,105 @@ class ContinuityDB:
             self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
             self._sync_conflicts(shot["scene_id"])
         return {"shot_id": shot_id, "element_id": element_id, "conflicts": self.list_conflicts(shot["scene_id"])}
+
+    def _reopen_and_recheck(self, shot_ids: list[int], user_id: int) -> tuple[list[int], list[int]]:
+        """演员安排变更后，涉及镜头回到待处理并重新检查所在场次。"""
+        now = datetime.now().isoformat()
+        reopened: list[int] = []
+        scene_ids: set[int] = set()
+        for shot_id in dict.fromkeys(shot_ids):
+            shot = self.conn.execute("SELECT scene_id,status FROM shots WHERE id=?", (shot_id,)).fetchone()
+            if not shot:
+                continue
+            scene_ids.add(shot["scene_id"])
+            if shot["status"] == "locked":
+                self.conn.execute(
+                    "UPDATE shots SET status='planned',version=version+1,updated_by=?,updated_at=? WHERE id=?",
+                    (user_id, now, shot_id),
+                )
+                reopened.append(shot_id)
+        for scene_id in sorted(scene_ids):
+            self._sync_conflicts(scene_id)
+        return reopened, sorted(scene_ids)
+
+    def _recheck_cast(self, element_id: int, user_id: int) -> tuple[list[int], list[int]]:
+        shot_ids = [r[0] for r in self.conn.execute(
+            "SELECT shot_id FROM shot_performances WHERE element_id=?", (element_id,)
+        )]
+        return self._reopen_and_recheck(shot_ids, user_id)
+
+    def set_performance(self, shot_id: int, element_id: int, actor_id: int | None, user_id: int) -> dict:
+        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        element = self._character_element(element_id)
+        if element["production_id"] != shot["production_id"]:
+            raise DomainError("镜头与角色不属于同一项目")
+        self._production_for_user(shot["production_id"], user_id)
+        with self.transaction():
+            if actor_id:
+                self._actor_in_production(shot["production_id"], actor_id)
+                try:
+                    self.conn.execute(
+                        "INSERT INTO shot_performances(shot_id,element_id,actor_id,updated_by,updated_at) VALUES(?,?,?,?,?)",
+                        (shot_id, element_id, actor_id, user_id, datetime.now().isoformat()),
+                    )
+                except sqlite3.IntegrityError:
+                    self.conn.execute(
+                        "UPDATE shot_performances SET actor_id=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
+                        (actor_id, user_id, datetime.now().isoformat(), shot_id, element_id),
+                    )
+            else:
+                cur = self.conn.execute(
+                    "DELETE FROM shot_performances WHERE shot_id=? AND element_id=?", (shot_id, element_id)
+                )
+                if cur.rowcount == 0:
+                    raise DomainError("该镜头未登记此角色的出演者")
+            reopened, _ = self._reopen_and_recheck([shot_id], user_id)
+        return {"shot_id": shot_id, "element_id": element_id, "actor_id": actor_id or None,
+                "reopened_shots": reopened, "conflicts": self.list_conflicts(shot["scene_id"])}
+
+    def set_shot_type(self, shot_id: int, shot_type: str, user_id: int) -> dict:
+        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        self._production_for_user(shot["production_id"], user_id)
+        if shot_type not in SHOT_TYPES:
+            raise DomainError("镜头类型必须是 dialogue 或 action")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE shots SET shot_type=?,version=version+1,updated_by=?,updated_at=? WHERE id=?",
+                (shot_type, user_id, datetime.now().isoformat(), shot_id),
+            )
+            reopened, _ = self._reopen_and_recheck([shot_id], user_id)
+        return {"shot_id": shot_id, "shot_type": shot_type,
+                "reopened_shots": reopened, "conflicts": self.list_conflicts(shot["scene_id"])}
+
+    def file_rotation(self, element_id: int, shot_id: int, actor_id: int, note: str, reviewer_id: int) -> int:
+        reviewer = self.conn.execute("SELECT role FROM users WHERE id=?", (reviewer_id,)).fetchone()
+        if not reviewer or reviewer["role"] != "reviewer":
+            raise DomainError("只有审片人可以备案主演轮换")
+        element = self._character_element(element_id)
+        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
+        if not shot or shot["production_id"] != element["production_id"]:
+            raise DomainError("镜头与角色不属于同一项目")
+        cast = self.conn.execute(
+            "SELECT cast_role FROM character_cast WHERE element_id=? AND actor_id=?", (element_id, actor_id)
+        ).fetchone()
+        if not cast or cast["cast_role"] != "lead":
+            raise DomainError("备案演员必须是该角色登记的主演")
+        if not note.strip():
+            raise DomainError("备案说明不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO rotation_filings(element_id,shot_id,actor_id,note,filed_by,filed_at) VALUES(?,?,?,?,?,?)",
+                    (element_id, shot_id, actor_id, note.strip(), reviewer_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该镜头的主演轮换已备案") from exc
+            self._sync_conflicts(shot["scene_id"])
+        return int(cur.lastrowid)
 
     def _detect_conflicts(self, scene_id: int) -> list[dict]:
         scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
@@ -335,8 +551,62 @@ class ContinuityDB:
                     })
         return detected
 
+    def _detect_cast_conflicts(self, scene_id: int) -> list[dict]:
+        scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
+        shots = self.conn.execute(
+            "SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene_id,)
+        ).fetchall()
+        characters = self.conn.execute(
+            "SELECT * FROM elements WHERE production_id=? AND kind='character' ORDER BY id", (scene["production_id"],)
+        ).fetchall()
+        actor_names = {r["id"]: r["name"] for r in self.conn.execute(
+            "SELECT id,name FROM actors WHERE production_id=?", (scene["production_id"],)
+        )}
+        detected: list[dict] = []
+        for character in characters:
+            cast = {r["actor_id"]: r["cast_role"] for r in self.conn.execute(
+                "SELECT actor_id,cast_role FROM character_cast WHERE element_id=?", (character["id"],)
+            )}
+            filings = {(r["shot_id"], r["actor_id"]) for r in self.conn.execute(
+                "SELECT shot_id,actor_id FROM rotation_filings WHERE element_id=?", (character["id"],)
+            )}
+            prev = None
+            for shot in shots:
+                perf = self.conn.execute(
+                    "SELECT actor_id FROM shot_performances WHERE shot_id=? AND element_id=?",
+                    (shot["id"], character["id"]),
+                ).fetchone()
+                if not perf:
+                    continue
+                actor_id = perf["actor_id"]
+                role = cast.get(actor_id)
+                name = actor_names.get(actor_id, str(actor_id))
+                kind = None
+                detail = ""
+                from_shot = shot
+                if role is None:
+                    kind = "unregistered_performer"
+                    detail = f"{name} 未登记为 {character['name']} 的主演或替身，却出演镜头 {shot['shot_code']}"
+                elif role == "standin" and shot["shot_type"] != "action":
+                    kind = "standin_in_dialogue"
+                    detail = f"对白镜头 {shot['shot_code']} 中 {character['name']} 由替身 {name} 出演"
+                elif (role == "lead" and prev and prev["role"] == "lead" and prev["actor_id"] != actor_id
+                      and (shot["id"], actor_id) not in filings):
+                    kind = "lead_rotation"
+                    detail = f"{character['name']} 的主演从 {prev['name']} 轮换为 {name}（镜头 {shot['shot_code']}），未经审片备案"
+                    from_shot = prev["shot"]
+                if kind:
+                    fingerprint = f"{scene_id}:{character['id']}:{from_shot['id']}:{shot['id']}:{kind}"
+                    detected.append({
+                        "scene_id": scene_id, "element_id": character["id"], "element_name": character["name"],
+                        "from_shot_id": from_shot["id"], "to_shot_id": shot["id"], "kind": kind,
+                        "detail": detail, "fingerprint": fingerprint,
+                    })
+                prev = {"shot": shot, "actor_id": actor_id, "role": role, "name": name}
+        return detected
+
     def _sync_conflicts(self, scene_id: int) -> None:
-        detected = self._detect_conflicts(scene_id)
+        detected = self._detect_conflicts(scene_id) + self._detect_cast_conflicts(scene_id)
         active_fingerprints = {row["fingerprint"] for row in detected}
         for row in self.conn.execute("SELECT * FROM conflicts WHERE scene_id=? AND active=1", (scene_id,)).fetchall():
             if row["fingerprint"] not in active_fingerprints:
@@ -480,11 +750,25 @@ class ContinuityDB:
         scenes = []
         for scene in self.conn.execute("SELECT * FROM scenes WHERE production_id=? ORDER BY narrative_order", (production_id,)).fetchall():
             shots = [dict(r) for r in self.conn.execute("SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene["id"],))]
+            for shot in shots:
+                shot["performances"] = [dict(p) for p in self.conn.execute(
+                    "SELECT sp.element_id,e.name AS element_name,sp.actor_id,a.name AS actor_name "
+                    "FROM shot_performances sp JOIN elements e ON e.id=sp.element_id JOIN actors a ON a.id=sp.actor_id "
+                    "WHERE sp.shot_id=? ORDER BY sp.id", (shot["id"],))]
             conflicts = self.list_conflicts(scene["id"], include_resolved=True)
             scenes.append({**dict(scene), "shots": shots, "conflicts": conflicts})
         return {
             "production": dict(production),
             "elements": [dict(r) for r in self.conn.execute("SELECT * FROM elements WHERE production_id=? ORDER BY id", (production_id,))],
+            "actors": [dict(r) for r in self.conn.execute("SELECT * FROM actors WHERE production_id=? ORDER BY id", (production_id,))],
+            "cast": [dict(r) for r in self.conn.execute(
+                "SELECT cc.element_id,e.name AS element_name,cc.actor_id,a.name AS actor_name,cc.cast_role "
+                "FROM character_cast cc JOIN elements e ON e.id=cc.element_id JOIN actors a ON a.id=cc.actor_id "
+                "WHERE e.production_id=? ORDER BY cc.id", (production_id,))],
+            "filings": [dict(r) for r in self.conn.execute(
+                "SELECT rf.element_id,e.name AS element_name,rf.shot_id,s.shot_code,rf.actor_id,a.name AS actor_name,rf.note,rf.filed_at "
+                "FROM rotation_filings rf JOIN elements e ON e.id=rf.element_id JOIN shots s ON s.id=rf.shot_id JOIN actors a ON a.id=rf.actor_id "
+                "WHERE e.production_id=? ORDER BY rf.id", (production_id,))],
             "scenes": scenes,
             "open_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "open"),
             "exempted_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "exempted"),
@@ -496,4 +780,11 @@ class ContinuityDB:
             "productions": [dict(r) for r in self.conn.execute("SELECT * FROM productions ORDER BY id")],
             "scenes": [dict(r) for r in self.conn.execute("SELECT * FROM scenes ORDER BY production_id,narrative_order")],
             "shots": [dict(r) for r in self.conn.execute("SELECT * FROM shots ORDER BY scene_id,narrative_order")],
+            "actors": [dict(r) for r in self.conn.execute("SELECT * FROM actors ORDER BY id")],
+            "character_cast": [dict(r) for r in self.conn.execute("SELECT * FROM character_cast ORDER BY id")],
+            "shot_performances": [dict(r) for r in self.conn.execute("SELECT * FROM shot_performances ORDER BY id")],
+            "rotation_filings": [dict(r) for r in self.conn.execute("SELECT * FROM rotation_filings ORDER BY id")],
+            "conflicts": [dict(r) for r in self.conn.execute("SELECT * FROM conflicts ORDER BY id")],
+            "adjustment_plans": [dict(r) for r in self.conn.execute("SELECT * FROM adjustment_plans ORDER BY id")],
+            "exemptions": [dict(r) for r in self.conn.execute("SELECT * FROM exemptions ORDER BY id")],
         }
