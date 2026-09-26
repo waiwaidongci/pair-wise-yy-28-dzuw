@@ -21,6 +21,16 @@ python -m unittest discover -s tests -v
 
 检测按叙事顺序执行，与剪辑和拍摄顺序无关。调整方案必须由制片人或场记提出、由另一位审片人批准；批准后写入镜头状态并重新检查。也可以为确实需要保留的冲突写入豁免理由。锁定会再次检查场次，豁免之外的活跃冲突会阻止锁定，锁定后直接改状态会失败。
 
+## 演员安排与出演连续性
+
+同一角色可能由不同演员或替身拍摄，演员安排纳入连续性检查：
+
+- 演员资料按项目登记，角色登记主演和允许的替身，镜头标明实际出演者和类型（`dialogue` 对白 / `action` 动作）。
+- 替身可以完成动作镜头；对白镜头出现替身会生成 `standin_in_dialogue` 冲突。
+- 实际出演者既不是主演也不是登记替身时，属于主演轮换，必须由审片人备案（`cast_filings`），否则生成 `rotation_not_filed` 冲突。
+- 修改演员安排（更换主演、登记或移除替身、轮换备案）后，涉及镜头回到待处理（解除锁定）并重新检查，旧冲突记录保留为已解决，不删除。
+- 出演冲突与元素冲突一样阻止镜头锁定，可由审片人豁免；已锁定镜头不能直接改出演或类型。
+
 ## 主要接口
 
 - `POST /api/users`、`POST /api/productions`
@@ -29,5 +39,10 @@ python -m unittest discover -s tests -v
 - `POST /api/shots/{id}/states`、`POST /api/scenes/{id}/check`
 - `POST /api/conflicts/{id}/plans`、`POST /api/plans/{id}/review`
 - `POST /api/conflicts/{id}/exemptions`
+- `POST /api/productions/{id}/actors`、`POST /api/productions/{id}/roles`
+- `POST /api/roles/{id}/lead`、`POST /api/roles/{id}/standins`、`POST /api/roles/{id}/standins/remove`
+- `POST /api/roles/{id}/filings`
+- `POST /api/shots/{id}/cast`、`POST /api/shots/{id}/type`
+- `POST /api/cast-conflicts/{id}/exemptions`
 - `POST /api/shots/{id}/lock`
 - `GET /api/productions/{id}/continuity`

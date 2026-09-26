@@ -13,6 +13,7 @@ class DomainError(ValueError):
 
 ELEMENT_KINDS = {"character", "costume", "prop", "injury"}
 RULES = {"stable", "monotonic", "allowed"}
+SHOT_TYPES = {"dialogue", "action"}
 
 
 class ContinuityDB:
@@ -70,6 +71,7 @@ class ContinuityDB:
               shoot_order INTEGER NOT NULL CHECK(shoot_order > 0),
               narrative_order INTEGER NOT NULL CHECK(narrative_order > 0),
               description TEXT NOT NULL DEFAULT '',
+              shot_type TEXT NOT NULL DEFAULT 'dialogue' CHECK(shot_type IN ('dialogue','action')),
               status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','locked')),
               version INTEGER NOT NULL DEFAULT 0,
               updated_by INTEGER NOT NULL REFERENCES users(id),
@@ -141,8 +143,74 @@ class ContinuityDB:
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS actors (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              production_id INTEGER NOT NULL REFERENCES productions(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              UNIQUE(production_id,name)
+            );
+            CREATE TABLE IF NOT EXISTS roles (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              production_id INTEGER NOT NULL REFERENCES productions(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              lead_actor_id INTEGER NOT NULL REFERENCES actors(id),
+              note TEXT NOT NULL DEFAULT '',
+              UNIQUE(production_id,name)
+            );
+            CREATE TABLE IF NOT EXISTS role_standins (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              UNIQUE(role_id,actor_id)
+            );
+            CREATE TABLE IF NOT EXISTS cast_filings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              reason TEXT NOT NULL,
+              approved_by INTEGER NOT NULL REFERENCES users(id),
+              approved_at TEXT NOT NULL,
+              UNIQUE(role_id,actor_id)
+            );
+            CREATE TABLE IF NOT EXISTS shot_cast (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              updated_by INTEGER NOT NULL REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              UNIQUE(shot_id,role_id)
+            );
+            CREATE TABLE IF NOT EXISTS cast_conflicts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              role_id INTEGER NOT NULL REFERENCES roles(id),
+              actor_id INTEGER NOT NULL REFERENCES actors(id),
+              kind TEXT NOT NULL,
+              detail TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','exempted','resolved')),
+              active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+              fingerprint TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cast_exemptions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              cast_conflict_id INTEGER NOT NULL UNIQUE REFERENCES cast_conflicts(id),
+              reason TEXT NOT NULL,
+              approved_by INTEGER NOT NULL REFERENCES users(id),
+              approved_at TEXT NOT NULL
+            );
             """
         )
+        shot_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(shots)")}
+        if "shot_type" not in shot_cols:
+            self.conn.execute(
+                "ALTER TABLE shots ADD COLUMN shot_type TEXT NOT NULL DEFAULT 'dialogue' "
+                "CHECK(shot_type IN ('dialogue','action'))"
+            )
         self.conn.commit()
 
     def seed_demo(self) -> None:
@@ -158,6 +226,16 @@ class ContinuityDB:
         injury = self.add_element(production, "主角左臂伤痕", "injury", "monotonic", "伤痕严重程度只能递增")
         self.set_element_state(s01, injury, "重度", 3, "", continuity)
         self.set_element_state(s02, injury, "轻度", 1, "", continuity)
+        lead = self.add_actor(production, "林岚", "女主角主演")
+        standin = self.add_actor(production, "赵武", "动作替身")
+        rotated = self.add_actor(production, "孙倩", "轮换演员")
+        role = self.add_role(production, "阿青", lead, "女主角")
+        self.add_standin(role, standin, continuity)
+        s03 = self.add_shot(scene, "S01-03", 3, 3, "巷尾对话", continuity)
+        self.set_shot_type(s02, "action", continuity)
+        self.set_shot_cast(s01, role, standin, continuity)
+        self.set_shot_cast(s02, role, standin, continuity)
+        self.set_shot_cast(s03, role, rotated, continuity)
         self.check_scene(scene)
 
     def add_user(self, name: str, role: str) -> int:
@@ -205,7 +283,7 @@ class ContinuityDB:
         return int(cur.lastrowid)
 
     def add_shot(self, scene_id: int, shot_code: str, shoot_order: int, narrative_order: int,
-                 description: str, user_id: int) -> int:
+                 description: str, user_id: int, shot_type: str = "dialogue") -> int:
         scene = self.conn.execute("SELECT production_id FROM scenes WHERE id=?", (scene_id,)).fetchone()
         if not scene:
             raise DomainError("场次不存在")
@@ -214,12 +292,14 @@ class ContinuityDB:
             raise DomainError("无权创建镜头")
         if not shot_code.strip() or shoot_order <= 0 or narrative_order <= 0:
             raise DomainError("镜头参数无效")
+        if shot_type not in SHOT_TYPES:
+            raise DomainError("镜头类型必须是 dialogue 或 action")
         with self.transaction():
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO shots(scene_id,shot_code,shoot_order,narrative_order,description,updated_by,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (scene_id, shot_code.strip(), shoot_order, narrative_order, description.strip(), user_id, datetime.now().isoformat()),
+                    "INSERT INTO shots(scene_id,shot_code,shoot_order,narrative_order,description,shot_type,updated_by,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (scene_id, shot_code.strip(), shoot_order, narrative_order, description.strip(), shot_type, user_id, datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("场次内镜头编号或叙事顺序重复") from exc
@@ -255,6 +335,186 @@ class ContinuityDB:
             except sqlite3.IntegrityError as exc:
                 raise DomainError("该状态转移已存在") from exc
         return int(cur.lastrowid)
+
+    def add_actor(self, production_id: int, name: str, note: str = "") -> int:
+        if not self.conn.execute("SELECT 1 FROM productions WHERE id=?", (production_id,)).fetchone():
+            raise DomainError("项目不存在")
+        if not name.strip():
+            raise DomainError("演员姓名不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO actors(production_id,name,note) VALUES(?,?,?)",
+                    (production_id, name.strip(), note.strip()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("项目内演员姓名不能重复") from exc
+        return int(cur.lastrowid)
+
+    def _actor_row(self, actor_id: int) -> sqlite3.Row:
+        actor = self.conn.execute("SELECT * FROM actors WHERE id=?", (actor_id,)).fetchone()
+        if not actor:
+            raise DomainError("演员不存在")
+        return actor
+
+    def _role_row(self, role_id: int) -> sqlite3.Row:
+        role = self.conn.execute("SELECT * FROM roles WHERE id=?", (role_id,)).fetchone()
+        if not role:
+            raise DomainError("角色不存在")
+        return role
+
+    def add_role(self, production_id: int, name: str, lead_actor_id: int, note: str = "") -> int:
+        if not self.conn.execute("SELECT 1 FROM productions WHERE id=?", (production_id,)).fetchone():
+            raise DomainError("项目不存在")
+        lead = self._actor_row(lead_actor_id)
+        if lead["production_id"] != production_id:
+            raise DomainError("主演必须属于本项目")
+        if not name.strip():
+            raise DomainError("角色名不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO roles(production_id,name,lead_actor_id,note) VALUES(?,?,?,?)",
+                    (production_id, name.strip(), lead_actor_id, note.strip()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("项目内角色名不能重复") from exc
+        return int(cur.lastrowid)
+
+    def _reopen_role_shots(self, role_id: int, user_id: int) -> list[int]:
+        """演员安排变更后，涉及镜头回到待处理（解锁），返回受影响场次。"""
+        scenes = [row["scene_id"] for row in self.conn.execute(
+            "SELECT DISTINCT s.scene_id FROM shot_cast sc JOIN shots s ON s.id=sc.shot_id WHERE sc.role_id=?",
+            (role_id,),
+        ).fetchall()]
+        self.conn.execute(
+            "UPDATE shots SET status='planned',version=version+1,updated_by=?,updated_at=? "
+            "WHERE status='locked' AND id IN (SELECT shot_id FROM shot_cast WHERE role_id=?)",
+            (user_id, datetime.now().isoformat(), role_id),
+        )
+        return scenes
+
+    def _recheck_scenes(self, scene_ids: list[int]) -> None:
+        for scene_id in dict.fromkeys(scene_ids):
+            self._sync_conflicts(scene_id)
+            self._sync_cast_conflicts(scene_id)
+
+    def _after_cast_change(self, role_id: int, user_id: int) -> list[int]:
+        scenes = self._reopen_role_shots(role_id, user_id)
+        self._recheck_scenes(scenes)
+        return scenes
+
+    def change_lead(self, role_id: int, actor_id: int, user_id: int) -> dict:
+        role = self._role_row(role_id)
+        actor = self._actor_row(actor_id)
+        if actor["production_id"] != role["production_id"]:
+            raise DomainError("演员与角色不属于同一项目")
+        user = self._production_for_user(role["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权更换主演")
+        if role["lead_actor_id"] == actor_id:
+            raise DomainError("该演员已是本角色主演")
+        with self.transaction():
+            self.conn.execute("UPDATE roles SET lead_actor_id=? WHERE id=?", (actor_id, role_id))
+            scenes = self._after_cast_change(role_id, user_id)
+        return {"role_id": role_id, "lead_actor_id": actor_id, "rechecked_scenes": scenes}
+
+    def add_standin(self, role_id: int, actor_id: int, user_id: int) -> int:
+        role = self._role_row(role_id)
+        actor = self._actor_row(actor_id)
+        if actor["production_id"] != role["production_id"]:
+            raise DomainError("演员与角色不属于同一项目")
+        user = self._production_for_user(role["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权登记替身")
+        if actor_id == role["lead_actor_id"]:
+            raise DomainError("主演不能同时登记为替身")
+        with self.transaction():
+            try:
+                cur = self.conn.execute("INSERT INTO role_standins(role_id,actor_id) VALUES(?,?)", (role_id, actor_id))
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该替身已登记") from exc
+            self._after_cast_change(role_id, user_id)
+        return int(cur.lastrowid)
+
+    def remove_standin(self, role_id: int, actor_id: int, user_id: int) -> dict:
+        role = self._role_row(role_id)
+        user = self._production_for_user(role["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权移除替身")
+        with self.transaction():
+            cur = self.conn.execute("DELETE FROM role_standins WHERE role_id=? AND actor_id=?", (role_id, actor_id))
+            if cur.rowcount == 0:
+                raise DomainError("该替身未登记")
+            scenes = self._after_cast_change(role_id, user_id)
+        return {"role_id": role_id, "actor_id": actor_id, "rechecked_scenes": scenes}
+
+    def file_rotation(self, role_id: int, actor_id: int, reason: str, reviewer_id: int) -> int:
+        role = self._role_row(role_id)
+        actor = self._actor_row(actor_id)
+        if actor["production_id"] != role["production_id"]:
+            raise DomainError("演员与角色不属于同一项目")
+        reviewer = self.conn.execute("SELECT role FROM users WHERE id=?", (reviewer_id,)).fetchone()
+        if not reviewer or reviewer["role"] != "reviewer":
+            raise DomainError("只有审片人可以备案主演轮换")
+        if actor_id == role["lead_actor_id"]:
+            raise DomainError("主演本人无需轮换备案")
+        if len(reason.strip()) < 8:
+            raise DomainError("备案理由至少8个字符")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO cast_filings(role_id,actor_id,reason,approved_by,approved_at) VALUES(?,?,?,?,?)",
+                    (role_id, actor_id, reason.strip(), reviewer_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该演员在此角色下已有轮换备案") from exc
+            self._after_cast_change(role_id, reviewer_id)
+        return int(cur.lastrowid)
+
+    def set_shot_cast(self, shot_id: int, role_id: int, actor_id: int, user_id: int) -> dict:
+        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        role = self._role_row(role_id)
+        actor = self._actor_row(actor_id)
+        if role["production_id"] != shot["production_id"] or actor["production_id"] != shot["production_id"]:
+            raise DomainError("镜头、角色与演员必须属于同一项目")
+        user = self._production_for_user(shot["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权标记出演安排")
+        if shot["status"] == "locked":
+            raise DomainError("镜头已锁定，不能直接修改出演安排")
+        with self.transaction():
+            try:
+                self.conn.execute(
+                    "INSERT INTO shot_cast(shot_id,role_id,actor_id,updated_by,updated_at) VALUES(?,?,?,?,?)",
+                    (shot_id, role_id, actor_id, user_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError:
+                self.conn.execute(
+                    "UPDATE shot_cast SET actor_id=?,updated_by=?,updated_at=? WHERE shot_id=? AND role_id=?",
+                    (actor_id, user_id, datetime.now().isoformat(), shot_id, role_id),
+                )
+            self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
+            self._recheck_scenes([shot["scene_id"]])
+        return {"shot_id": shot_id, "role_id": role_id, "actor_id": actor_id, "cast_conflicts": self.list_cast_conflicts(shot["scene_id"])}
+
+    def set_shot_type(self, shot_id: int, shot_type: str, user_id: int) -> dict:
+        shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError("镜头不存在")
+        user = self._production_for_user(shot["production_id"], user_id)
+        if user["role"] not in {"producer", "continuity"}:
+            raise DomainError("无权修改镜头类型")
+        if shot["status"] == "locked":
+            raise DomainError("镜头已锁定，不能直接修改类型")
+        if shot_type not in SHOT_TYPES:
+            raise DomainError("镜头类型必须是 dialogue 或 action")
+        with self.transaction():
+            self.conn.execute("UPDATE shots SET shot_type=?,version=version+1,updated_by=?,updated_at=? WHERE id=?", (shot_type, user_id, datetime.now().isoformat(), shot_id))
+            self._recheck_scenes([shot["scene_id"]])
+        return {"shot_id": shot_id, "shot_type": shot_type, "cast_conflicts": self.list_cast_conflicts(shot["scene_id"])}
 
     def set_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
                           note: str, user_id: int) -> dict:
@@ -359,11 +619,98 @@ class ContinuityDB:
                     (issue["scene_id"], issue["element_id"], issue["from_shot_id"], issue["to_shot_id"], issue["kind"], issue["detail"], issue["fingerprint"], datetime.now().isoformat(), datetime.now().isoformat()),
                 )
 
+    def _detect_cast_conflicts(self, scene_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT sc.shot_id,sc.role_id,sc.actor_id,s.shot_code,s.shot_type,"
+            "r.name AS role_name,r.lead_actor_id,a.name AS actor_name "
+            "FROM shot_cast sc JOIN shots s ON s.id=sc.shot_id "
+            "JOIN roles r ON r.id=sc.role_id JOIN actors a ON a.id=sc.actor_id "
+            "WHERE s.scene_id=? ORDER BY s.narrative_order", (scene_id,),
+        ).fetchall()
+        detected: list[dict] = []
+        for row in rows:
+            if row["actor_id"] == row["lead_actor_id"]:
+                continue
+            standin = self.conn.execute(
+                "SELECT 1 FROM role_standins WHERE role_id=? AND actor_id=?", (row["role_id"], row["actor_id"])
+            ).fetchone()
+            kind = None
+            detail = ""
+            if standin:
+                if row["shot_type"] == "dialogue":
+                    kind = "standin_in_dialogue"
+                    detail = f"对白镜头 {row['shot_code']} 中角色 {row['role_name']} 由替身 {row['actor_name']} 出演"
+            else:
+                filed = self.conn.execute(
+                    "SELECT 1 FROM cast_filings WHERE role_id=? AND actor_id=?", (row["role_id"], row["actor_id"])
+                ).fetchone()
+                if not filed:
+                    kind = "rotation_not_filed"
+                    detail = f"镜头 {row['shot_code']} 中角色 {row['role_name']} 由 {row['actor_name']} 轮换出演，未经审片备案"
+            if kind:
+                detected.append({
+                    "scene_id": scene_id, "shot_id": row["shot_id"], "role_id": row["role_id"],
+                    "actor_id": row["actor_id"], "kind": kind, "detail": detail,
+                    "fingerprint": f"cast:{row['shot_id']}:{row['role_id']}:{row['actor_id']}:{kind}",
+                })
+        return detected
+
+    def _sync_cast_conflicts(self, scene_id: int) -> None:
+        detected = self._detect_cast_conflicts(scene_id)
+        active_fingerprints = {row["fingerprint"] for row in detected}
+        for row in self.conn.execute("SELECT * FROM cast_conflicts WHERE scene_id=? AND active=1", (scene_id,)).fetchall():
+            if row["fingerprint"] not in active_fingerprints:
+                self.conn.execute(
+                    "UPDATE cast_conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
+                    (datetime.now().isoformat(), row["id"]),
+                )
+        for issue in detected:
+            existing = self.conn.execute("SELECT * FROM cast_conflicts WHERE fingerprint=?", (issue["fingerprint"],)).fetchone()
+            if existing:
+                status = "exempted" if existing["status"] == "exempted" else "open"
+                self.conn.execute(
+                    "UPDATE cast_conflicts SET active=1,status=?,detail=?,updated_at=? WHERE id=?",
+                    (status, issue["detail"], datetime.now().isoformat(), existing["id"]),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO cast_conflicts(scene_id,shot_id,role_id,actor_id,kind,detail,status,active,fingerprint,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?, 'open',1,?,?,?)",
+                    (issue["scene_id"], issue["shot_id"], issue["role_id"], issue["actor_id"], issue["kind"], issue["detail"], issue["fingerprint"], datetime.now().isoformat(), datetime.now().isoformat()),
+                )
+
+    def list_cast_conflicts(self, scene_id: int, include_resolved: bool = False) -> list[dict]:
+        clause = "" if include_resolved else "AND c.active=1"
+        return [dict(row) for row in self.conn.execute(
+            "SELECT c.*,r.name AS role_name,a.name AS actor_name,s.shot_code "
+            "FROM cast_conflicts c JOIN roles r ON r.id=c.role_id JOIN actors a ON a.id=c.actor_id JOIN shots s ON s.id=c.shot_id "
+            f"WHERE c.scene_id=? {clause} ORDER BY c.id", (scene_id,)
+        ).fetchall()]
+
+    def exempt_cast_conflict(self, conflict_id: int, reason: str, reviewer_id: int) -> int:
+        reviewer = self.conn.execute("SELECT role FROM users WHERE id=?", (reviewer_id,)).fetchone()
+        conflict = self.conn.execute("SELECT * FROM cast_conflicts WHERE id=?", (conflict_id,)).fetchone()
+        if not conflict or not conflict["active"] or not reviewer or reviewer["role"] != "reviewer":
+            raise DomainError("出演冲突或审片人无效")
+        if len(reason.strip()) < 8:
+            raise DomainError("豁免理由至少8个字符")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO cast_exemptions(cast_conflict_id,reason,approved_by,approved_at) VALUES(?,?,?,?)",
+                    (conflict_id, reason.strip(), reviewer_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该出演冲突已经豁免") from exc
+            self.conn.execute("UPDATE cast_conflicts SET status='exempted',updated_at=? WHERE id=?", (datetime.now().isoformat(), conflict_id))
+        return int(cur.lastrowid)
+
     def check_scene(self, scene_id: int) -> list[dict]:
         if not self.conn.execute("SELECT 1 FROM scenes WHERE id=?", (scene_id,)).fetchone():
             raise DomainError("场次不存在")
         with self.transaction():
             self._sync_conflicts(scene_id)
+            self._sync_cast_conflicts(scene_id)
         return self.list_conflicts(scene_id)
 
     def list_conflicts(self, scene_id: int, include_resolved: bool = False) -> list[dict]:
@@ -466,8 +813,11 @@ class ContinuityDB:
             raise DomainError("无权锁定镜头")
         with self.transaction():
             self._sync_conflicts(shot["scene_id"])
+            self._sync_cast_conflicts(shot["scene_id"])
             blocking = self.conn.execute(
-                "SELECT COUNT(*) FROM conflicts WHERE scene_id=? AND active=1 AND status!='exempted'", (shot["scene_id"],)
+                "SELECT (SELECT COUNT(*) FROM conflicts WHERE scene_id=? AND active=1 AND status!='exempted') + "
+                "(SELECT COUNT(*) FROM cast_conflicts WHERE scene_id=? AND active=1 AND status!='exempted')",
+                (shot["scene_id"], shot["scene_id"]),
             ).fetchone()[0]
             if blocking:
                 raise DomainError(f"场次仍有 {blocking} 个未处理冲突，不能锁定")
@@ -480,14 +830,37 @@ class ContinuityDB:
         scenes = []
         for scene in self.conn.execute("SELECT * FROM scenes WHERE production_id=? ORDER BY narrative_order", (production_id,)).fetchall():
             shots = [dict(r) for r in self.conn.execute("SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene["id"],))]
+            cast_rows = self.conn.execute(
+                "SELECT sc.shot_id,sc.role_id,r.name AS role_name,sc.actor_id,a.name AS actor_name "
+                "FROM shot_cast sc JOIN roles r ON r.id=sc.role_id JOIN actors a ON a.id=sc.actor_id "
+                "WHERE sc.shot_id IN (SELECT id FROM shots WHERE scene_id=?) ORDER BY sc.id", (scene["id"],)
+            ).fetchall()
+            for shot in shots:
+                shot["cast"] = [dict(c) for c in cast_rows if c["shot_id"] == shot["id"]]
             conflicts = self.list_conflicts(scene["id"], include_resolved=True)
-            scenes.append({**dict(scene), "shots": shots, "conflicts": conflicts})
+            cast_conflicts = self.list_cast_conflicts(scene["id"], include_resolved=True)
+            scenes.append({**dict(scene), "shots": shots, "conflicts": conflicts, "cast_conflicts": cast_conflicts})
+        roles = []
+        for role in self.conn.execute("SELECT * FROM roles WHERE production_id=? ORDER BY id", (production_id,)).fetchall():
+            lead = self.conn.execute("SELECT name FROM actors WHERE id=?", (role["lead_actor_id"],)).fetchone()
+            standins = [dict(r) for r in self.conn.execute(
+                "SELECT a.id AS actor_id,a.name FROM role_standins rs JOIN actors a ON a.id=rs.actor_id WHERE rs.role_id=? ORDER BY rs.id", (role["id"],)
+            )]
+            filings = [dict(r) for r in self.conn.execute(
+                "SELECT cf.actor_id,a.name AS actor_name,cf.reason,cf.approved_by,cf.approved_at "
+                "FROM cast_filings cf JOIN actors a ON a.id=cf.actor_id WHERE cf.role_id=? ORDER BY cf.id", (role["id"],)
+            )]
+            roles.append({**dict(role), "lead_name": lead["name"] if lead else "", "standins": standins, "filings": filings})
         return {
             "production": dict(production),
             "elements": [dict(r) for r in self.conn.execute("SELECT * FROM elements WHERE production_id=? ORDER BY id", (production_id,))],
+            "actors": [dict(r) for r in self.conn.execute("SELECT * FROM actors WHERE production_id=? ORDER BY id", (production_id,))],
+            "roles": roles,
             "scenes": scenes,
             "open_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "open"),
             "exempted_conflicts": sum(1 for scene in scenes for c in scene["conflicts"] if c["active"] and c["status"] == "exempted"),
+            "open_cast_conflicts": sum(1 for scene in scenes for c in scene["cast_conflicts"] if c["active"] and c["status"] == "open"),
+            "exempted_cast_conflicts": sum(1 for scene in scenes for c in scene["cast_conflicts"] if c["active"] and c["status"] == "exempted"),
         }
 
     def snapshot(self) -> dict:
@@ -496,4 +869,9 @@ class ContinuityDB:
             "productions": [dict(r) for r in self.conn.execute("SELECT * FROM productions ORDER BY id")],
             "scenes": [dict(r) for r in self.conn.execute("SELECT * FROM scenes ORDER BY production_id,narrative_order")],
             "shots": [dict(r) for r in self.conn.execute("SELECT * FROM shots ORDER BY scene_id,narrative_order")],
+            "actors": [dict(r) for r in self.conn.execute("SELECT * FROM actors ORDER BY production_id,id")],
+            "roles": [dict(r) for r in self.conn.execute("SELECT * FROM roles ORDER BY production_id,id")],
+            "role_standins": [dict(r) for r in self.conn.execute("SELECT * FROM role_standins ORDER BY role_id,id")],
+            "cast_filings": [dict(r) for r in self.conn.execute("SELECT * FROM cast_filings ORDER BY role_id,id")],
+            "shot_cast": [dict(r) for r in self.conn.execute("SELECT * FROM shot_cast ORDER BY shot_id,role_id")],
         }
